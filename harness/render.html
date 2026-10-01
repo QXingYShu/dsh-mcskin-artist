@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>RENDER-BOOT</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #12141a; overflow: hidden; }
+  #stage { position: absolute; left: 0; top: 0; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="gl-canvas" width="400" height="460"></canvas></div>
+
+<!-- mcskin-artist 无头渲染探针（归属：skin-render，契约 CONTRACT.md §2.2）
+     加载顺序：rules.js → renderer3d.js（model.js 不需要）；
+     下面这行注释由 bin/render.mjs 替换为注入脚本：
+       window.__SKIN__ = 皮肤 PNG 的 dataURL
+       window.__PLAN__ = { canvas:{width,height}, scale, background, format,
+                           views:[{id,yaw,pitch}], poses:[{id,anim,time,view,yaw,pitch}] }
+     产出：<script id="probe-json" type="application/json">{items,errors}</script>
+           document.title = RENDER-DONE（有产物）/ RENDER-FAIL（无产物）
+     姿态确定性：setAnimation + setAnimationTime + pauseAnimation(true) + setAutoRotate(false) -->
+<script src="../lib/rules.js"></script>
+<script src="../lib/renderer3d.js"></script>
+<!--__INJECT__-->
+
+<script>
+(function () {
+  'use strict';
+
+  var DEFAULT_W = 400, DEFAULT_H = 460, DEFAULT_BG = '#12141a';
+  var items = [], errors = [], done = false;
+
+  function msg(e) { return (e && e.message) ? e.message : String(e); }
+
+  /* 唯一收尾点：写 probe-json 并定标题。多次调用只生效一次。 */
+  function finish() {
+    if (done) return;
+    done = true;
+    try {
+      var el = document.createElement('script');
+      el.type = 'application/json';
+      el.id = 'probe-json';
+      el.textContent = JSON.stringify({ items: items, errors: errors });
+      document.body.appendChild(el);
+    } catch (e) {
+      errors.push('写入 probe-json 失败：' + msg(e));
+    }
+    document.title = items.length ? 'RENDER-DONE' : 'RENDER-FAIL';
+  }
+
+  /* 没写完 probe 就崩掉时兜底，避免 headless 只拿到 parseError */
+  window.onerror = function (m, src, line, col) {
+    errors.push('未捕获异常：' + m + ' @' + line + ':' + col);
+    finish();
+    return false;
+  };
+  window.addEventListener('unhandledrejection', function (ev) {
+    errors.push('未处理的 Promise 拒绝：' + msg(ev && ev.reason));
+    finish();
+  });
+
+  function loadImage(src) {
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      img.onload = function () { resolve(img); };
+      img.onerror = function () { reject(new Error('皮肤 PNG 无法解码（dataURL 无效或不是 PNG）')); };
+      img.src = src;
+    });
+  }
+
+  function toImageData(img) {
+    var w = img.naturalWidth || img.width || 64;
+    var h = img.naturalHeight || img.height || 64;
+    var c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    var ctx = c.getContext('2d');
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0);
+    return ctx.getImageData(0, 0, w, h);
+  }
+
+  function main() {
+    var plan = window.__PLAN__;
+    var skin = window.__SKIN__;
+    if (!plan || typeof plan !== 'object') { errors.push('缺少 window.__PLAN__（应由 bin/render.mjs 注入）'); finish(); return; }
+    if (!skin) { errors.push('缺少 window.__SKIN__（应由 bin/render.mjs 注入皮肤 dataURL）'); finish(); return; }
+    if (typeof MCSKIN === 'undefined' || !MCSKIN.rules) { errors.push('MCSKIN.rules 未加载：../lib/rules.js 不可用'); finish(); return; }
+    if (!MCSKIN.renderer || typeof MCSKIN.renderer.create !== 'function') { errors.push('MCSKIN.renderer 未加载：../lib/renderer3d.js 不可用'); finish(); return; }
+
+    var cw = (plan.canvas && plan.canvas.width) || DEFAULT_W;
+    var ch = (plan.canvas && plan.canvas.height) || DEFAULT_H;
+    var scale = Math.max(1, Math.min(2, plan.scale || 1));
+
+    var glCanvas = document.getElementById('gl-canvas');
+    glCanvas.width = cw; glCanvas.height = ch;
+    glCanvas.style.width = cw + 'px'; glCanvas.style.height = ch + 'px';
+
+    var renderer;
+    try {
+      renderer = MCSKIN.renderer.create(glCanvas, {
+        yaw: 0, pitch: 0, zoom: 1, distance: 52, fov: 45,
+        autoRotate: false, showGround: false, cull: true
+      });
+    } catch (e) {
+      errors.push('创建 renderer 失败：' + msg(e)); finish(); return;
+    }
+
+    if (!renderer.gl || !renderer.ok) {
+      errors.push('WebGL 不可用：' + (renderer.error || '浏览器未提供 webgl/experimental-webgl 上下文'));
+      finish(); return;
+    }
+    renderer.setAutoRotate(false);
+    renderer.setAnimation('none');
+    renderer.pauseAnimation(true);
+    renderer.resize();
+
+    /* 深色底 + 可选整数放大：WebGL 画布是透明底，直接 toDataURL 会得到全透明 PNG */
+    var outCanvas = document.createElement('canvas');
+    outCanvas.width = Math.round(cw * scale);
+    outCanvas.height = Math.round(ch * scale);
+    var octx = outCanvas.getContext('2d');
+
+    function capture() {
+      octx.fillStyle = plan.background || DEFAULT_BG;
+      octx.fillRect(0, 0, outCanvas.width, outCanvas.height);
+      octx.imageSmoothingEnabled = false;
+      octx.drawImage(glCanvas, 0, 0, outCanvas.width, outCanvas.height);
+      return outCanvas.toDataURL('image/png');
+    }
+
+    function renderOnce(kind, id, view, anim, time) {
+      try {
+        if (kind === 'pose') {
+          /* 契约 §2.1：确定性冻结（先设模式，再设时间，再冻结，最后关自动旋转） */
+          renderer.setAnimation(anim || 'idle');
+          renderer.setAnimationTime(typeof time === 'number' ? time : 0);
+          renderer.pauseAnimation(true);
+        } else {
+          renderer.setAnimation('none');
+          renderer.pauseAnimation(true);
+        }
+        renderer.setAutoRotate(false);
+        renderer.setRotation(view.yaw || 0, view.pitch || 0);
+        renderer.render();
+        var dataurl = capture();
+        if (!dataurl || dataurl.indexOf('data:image/png') !== 0) throw new Error('canvas.toDataURL 未返回 PNG');
+        items.push({
+          id: id, kind: kind,
+          yaw: view.yaw || 0, pitch: view.pitch || 0,
+          anim: anim || null, time: typeof time === 'number' ? time : null,
+          view: view.id || null, dataurl: dataurl
+        });
+      } catch (e) {
+        errors.push((kind === 'pose' ? '姿态 ' : '视角 ') + id + ' 渲染失败：' + msg(e));
+      }
+    }
+
+    loadImage(skin).then(function (img) {
+      var imageData;
+      try { imageData = toImageData(img); }
+      catch (e) { errors.push('读取皮肤像素失败：' + msg(e)); finish(); return; }
+
+      if (imageData.height !== 64 && imageData.height !== 32) {
+        errors.push('皮肤尺寸异常：' + imageData.width + '×' + imageData.height + '（应为 64×64 或 64×32）');
+      }
+      try { renderer.setSkin(imageData, plan.format || null); }
+      catch (e) { errors.push('setSkin 失败：' + msg(e)); finish(); return; }
+      if (!renderer.ok) { errors.push('渲染器不可用：' + (renderer.error || '未知原因')); finish(); return; }
+
+      var views = plan.views || [];
+      var poses = plan.poses || [];
+      for (var i = 0; i < views.length; i++) renderOnce('view', views[i].id, views[i], null, null);
+      for (var j = 0; j < poses.length; j++) renderOnce('pose', poses[j].id, poses[j], poses[j].anim, poses[j].time);
+      finish();
+    }).catch(function (e) {
+      errors.push('皮肤加载失败：' + msg(e));
+      finish();
+    });
+  }
+
+  setTimeout(function () {
+    if (!done) { errors.push('渲染超时：未在计划时间内完成（可能是图片解码或 WebGL 卡住）'); finish(); }
+  }, 10000);
+
+  try { main(); }
+  catch (e) { errors.push('探针初始化失败：' + msg(e)); finish(); }
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+# dsh-mcskin-artist bundle patch: inserts the plugin's host entry into the
+# profile roster so `ctx.tools` is available when it applies.
+#
+# Install with:  dsh plugin --profile <name> add <path-to-this-dir>
+- insert:
+    - id: mcskin-artist
+      name: 'dsh-mcskin-artist'

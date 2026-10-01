@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.DS_Store
+
+# Scratch output from the smoke test and local trial runs
+.smoke-out/
+*.review/
+rounds/
+*.round*.png
